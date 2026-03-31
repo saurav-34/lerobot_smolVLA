@@ -84,7 +84,8 @@ class FlorenceVisionEncoder(nn.Module):
                 attn_implementation="eager",
                 low_cpu_mem_usage=False,  # Block ghost tensors
                 _fast_init=False,         # Block meta-device context managers
-                device_map=None           # Block accelerate auto-routing
+                device_map=None,        # Block accelerate auto-routing
+                torch_dtype=torch.bfloat16
             )
         # --------------------------------------
         
