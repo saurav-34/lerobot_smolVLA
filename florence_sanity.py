@@ -21,11 +21,21 @@ warnings.filterwarnings('ignore')
 
 model_id = 'microsoft/Florence-2-base'
 print('Loading model...')
-model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, attn_implementation='eager')
+florence = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, attn_implementation='eager')
 
-print('Vision tower loaded:', type(model.vision_tower).__name__)
+if hasattr(florence, 'model') and hasattr(florence.model, 'vision_tower'):
+    vision_tower = florence.model.vision_tower
+else:
+    vision_tower = florence.vision_tower
+
+print('Vision tower isolated:', type(vision_tower).__name__)
+
+# Freeze the vision tower
+for param in vision_tower.parameters():
+    param.requires_grad = False
+
 dummy = torch.randn(1, 3, 768, 768)
 
 with torch.no_grad():
-    res = model._encode_image(dummy)
+    res = florence._encode_image(dummy)
     print('Output shape:', res.shape)
