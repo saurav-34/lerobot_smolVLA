@@ -19,21 +19,6 @@ from transformers import AutoModelForCausalLM
 import warnings
 warnings.filterwarnings('ignore')
 
-model_id = 'microsoft/Florence-2-base'
-print('Loading model...')
-florence = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, attn_implementation='eager')
-
-if hasattr(florence, 'model') and hasattr(florence.model, 'vision_tower'):
-    vision_tower = florence.model.vision_tower
-else:
-    vision_tower = florence.vision_tower
-
-print('Vision tower isolated:', type(vision_tower).__name__)
-
-# Freeze the vision tower
-for param in vision_tower.parameters():
-    param.requires_grad = False
-
 class TokenReducer(torch.nn.Module):
     def __init__(self, in_features=768, out_features=768, factor=3):
         super().__init__()
@@ -59,13 +44,78 @@ class TokenReducer(torch.nn.Module):
         
         return self.proj(reduced)
 
-token_reducer = TokenReducer(in_features=768, out_features=768, factor=3)
 
-dummy = torch.randn(1, 3, 768, 768)
+class FlorenceVisionEncoder(torch.nn.Module):
+    def __init__(
+        self, 
+        model_id='microsoft/Florence-2-base', 
+        hidden_size=2048,  # Target LLM dimension 
+        use_pixel_shuffle=True, 
+        factor=3
+    ):
+        super().__init__()
+        print(f'Loading {model_id} for vision encoder...')
+        self.florence = AutoModelForCausalLM.from_pretrained(
+            model_id, 
+            trust_remote_code=True, 
+            attn_implementation='eager'
+        )
+        
+        # Freeze the entire Florence model (including vision tower, embeddings, logic)
+        for param in self.florence.parameters():
+            param.requires_grad = False
+            
+        self.use_pixel_shuffle = use_pixel_shuffle
+        
+        # The output of Florence's `_encode_image` is typically 768 for Florence-2-base
+        davit_out_dim = 768
+        
+        if self.use_pixel_shuffle:
+            self.token_reducer = TokenReducer(
+                in_features=davit_out_dim, 
+                out_features=davit_out_dim, 
+                factor=factor
+            )
+            
+        # Linear projection to LLM hidden dimension
+        self.proj = torch.nn.Linear(davit_out_dim, hidden_size)
+        
+        # Final LayerNorm
+        self.norm = torch.nn.LayerNorm(hidden_size)
 
-with torch.no_grad():
-    res = florence._encode_image(dummy)
-    print('Original output shape:', res.shape)
+    def forward(self, pixel_values):
+        """
+        Args:
+            pixel_values: Tensor of shape [B, C, H, W] representing images
+        Returns:
+            Tensor of shape [B, T, D_lm] with projected visual tokens
+        """
+        # Get DaViT tokens + positional embeddings via Florence's official _encode_image
+        with torch.no_grad():
+            x = self.florence._encode_image(pixel_values)
+            
+        # x is originally [B, 577, 768] (with factor=3 and 24x24 patches)
+        if self.use_pixel_shuffle:
+            x = self.token_reducer(x)
+            
+        # Linear projection to [B, T, D_lm]
+        x = self.proj(x)
+        
+        # LayerNorm
+        x = self.norm(x)
+        
+        return x
+
+if __name__ == "__main__":
+    # Test FlorenceVisionEncoder
+    encoder = FlorenceVisionEncoder(hidden_size=2048)
     
-    reduced_res = token_reducer(res)
-    print('Reduced token output shape:', reduced_res.shape)
+    dummy_images = torch.randn(2, 3, 768, 768)
+    
+    print('Testing FlorenceVisionEncoder forward pass...')
+    out = encoder(dummy_images)
+    
+    print('Input images shape:', dummy_images.shape)
+    print('Output visual tokens shape:', out.shape)
+    assert out.shape == (2, 64, 2048), f"Expected shape (2, 64, 2048), got {out.shape}"
+    print("Passed!")
