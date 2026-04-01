@@ -156,7 +156,7 @@ class SmolVLMWithExpertModel(nn.Module):
         num_expert_layers: int = -1,
         num_vlm_layers: int = -1,
         self_attn_every_n_layers: int = -1,
-        expert_width_multiplier: float = 0.5,
+        expert_width_multiplier: float = 0.75,
         device: str = "auto",
         vision_backbone: str = "microsoft/Florence-2-base",
     ):
@@ -175,7 +175,7 @@ class SmolVLMWithExpertModel(nn.Module):
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
-                torch_dtype="bfloat16",
+                torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
             )
             config = self.vlm.config
@@ -188,6 +188,21 @@ class SmolVLMWithExpertModel(nn.Module):
         # 3. SWAP THE ENCODER
         if florence_encoder:
             self.get_vlm_model().vision_model = florence_encoder
+
+            # Replace multimodal connector to map Florence (768) -> SmolLM (D_lm)
+            D_lm = config.text_config.hidden_size
+            new_connector = nn.Sequential(
+                nn.Linear(florence_encoder.hidden_size, D_lm, dtype=torch.bfloat16),
+                nn.LayerNorm(D_lm, dtype=torch.bfloat16)
+            )
+            
+            # Safe initialization to avoid large activations that destabilize early training
+            nn.init.xavier_uniform_(new_connector[0].weight)
+            nn.init.zeros_(new_connector[0].bias)
+            nn.init.ones_(new_connector[1].weight)
+            nn.init.zeros_(new_connector[1].bias)
+            
+            self.get_vlm_model().connector = new_connector
 
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
