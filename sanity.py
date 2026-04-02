@@ -1,13 +1,13 @@
 import torch
- import transformers.utils
-> transformers.utils.is_flash_attn_greater_or_equal_2_10 = lambda: False
-> transformers.utils.is_flash_attn_2_available = lambda: False
-> 
-> import transformers.dynamic_module_utils as dyn_utils
-> dyn_utils.check_imports = lambda filename: []
-> 
-> import transformers.configuration_utils as config_utils
-> if not hasattr(config_utils.PretrainedConfig, 'forced_bos_token_id'):
+import transformers.utils
+transformers.utils.is_flash_attn_greater_or_equal_2_10 = lambda: False
+transformers.utils.is_flash_attn_2_available = lambda: False
+ 
+import transformers.dynamic_module_utils as dyn_utils
+dyn_utils.check_imports = lambda filename: []
+ 
+import transformers.configuration_utils as config_utils
+if not hasattr(config_utils.PretrainedConfig, 'forced_bos_token_id'):
 >     config_utils.PretrainedConfig.forced_bos_token_id = None
 > 
 > from transformers.modeling_utils import PreTrainedModel
