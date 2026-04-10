@@ -71,15 +71,36 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        use_qlora: bool = False,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_target_modules: list = None,
     ):
         super().__init__()
+        self.use_qlora = use_qlora
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
-            self.vlm = AutoModelForImageTextToText.from_pretrained(
-                model_id,
-                torch_dtype="bfloat16",
-                low_cpu_mem_usage=True,
-            )
+            if use_qlora:
+                from transformers import BitsAndBytesConfig
+
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",        # NormalFloat4 — best accuracy at 4-bit
+                    bnb_4bit_use_double_quant=True,   # quantize the quantization constants too
+                    bnb_4bit_compute_dtype=torch.bfloat16,  # activations stay BF16
+                )
+                self.vlm = AutoModelForImageTextToText.from_pretrained(
+                    model_id,
+                    quantization_config=bnb_config,
+                    low_cpu_mem_usage=True,
+                )
+            else:
+                self.vlm = AutoModelForImageTextToText.from_pretrained(
+                    model_id,
+                    torch_dtype="bfloat16",
+                    low_cpu_mem_usage=True,
+                )
             config = self.vlm.config
         else:
             config = AutoConfig.from_pretrained(model_id)
@@ -130,17 +151,63 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+
+        if use_qlora and load_vlm_weights:
+            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+            if lora_target_modules is None:
+                lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "proj"]
+            # Prepares 4-bit model for training: enables gradient checkpointing,
+            # casts non-quantized params (LayerNorm, embed) to float32 for stability.
+            prepare_model_for_kbit_training(self.vlm, use_gradient_checkpointing=True)
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+            )
+            # Wrap the whole VLM so LoRA reaches both the text model and the connector.
+            # PEFT proxies attribute access so self.vlm.model still resolves correctly.
+            # Vision encoder layers are excluded via modules_to_save / target_modules names.
+            self.vlm = get_peft_model(self.vlm, lora_config)
+            print(
+                f"QLoRA enabled: VLM loaded in 4-bit NF4, LoRA r={lora_r} on "
+                f"{lora_target_modules}."
+            )
+
         self.set_requires_grad()
 
     def get_vlm_model(self):
-        return self.vlm.model
+        # Traverse PeftModel / LoraModel wrappers until we reach SmolVLMModel
+        # (identified by having a `vision_model` attribute).
+        obj = self.vlm
+        while not hasattr(obj, "vision_model"):
+            if hasattr(obj, "base_model"):
+                obj = obj.base_model
+            elif hasattr(obj, "model"):
+                obj = obj.model
+            else:
+                break
+        return obj
 
     def set_requires_grad(self):
         if self.freeze_vision_encoder:
             self.get_vlm_model().vision_model.eval()
             for params in self.get_vlm_model().vision_model.parameters():
                 params.requires_grad = False
-        if self.train_expert_only:
+
+        if self.use_qlora:
+            # Freeze all VLM params except LoRA adapters (already requires_grad=True from PEFT).
+            for name, params in self.vlm.named_parameters():
+                if "lora_" not in name:
+                    params.requires_grad = False
+            # Also freeze LoRA params inside vision encoder (freeze_vision_encoder=True).
+            if self.freeze_vision_encoder:
+                for name, params in self.vlm.named_parameters():
+                    if "vision_model" in name:
+                        params.requires_grad = False
+        elif self.train_expert_only:
             self.vlm.eval()
             for params in self.vlm.parameters():
                 params.requires_grad = False
@@ -173,7 +240,7 @@ class SmolVLMWithExpertModel(nn.Module):
         if self.freeze_vision_encoder:
             self.get_vlm_model().vision_model.eval()
 
-        if self.train_expert_only:
+        if self.train_expert_only and not self.use_qlora:
             self.vlm.eval()
 
     def embed_image(self, image: torch.Tensor):
