@@ -25,6 +25,14 @@ from transformers import (
 )
 
 
+def get_compute_dtype(linear_module) -> torch.dtype:
+    """Return the floating-point compute dtype of a linear layer.
+    For 4-bit quantized (BnB) layers, weight.dtype is uint8 (storage).
+    In that case fall back to BF16 which matches bnb_4bit_compute_dtype."""
+    dtype = linear_module.weight.dtype
+    return dtype if dtype.is_floating_point else torch.bfloat16
+
+
 def apply_rope(x, positions, max_wavelength=10_000):
     """
     Applies RoPE positions [B, L] to x [B, L, H, D].
@@ -143,6 +151,12 @@ class SmolVLMWithExpertModel(nn.Module):
                 )
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None
+
+        # Move expert to the same device as the VLM after all modifications are done
+        # (device_map="auto" may place VLM on GPU; cross-attn k/v proj must be on same device).
+        if load_vlm_weights:
+            _vlm_device = next(self.get_vlm_model().parameters()).device
+            self.lm_expert = self.lm_expert.to(_vlm_device)
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
@@ -280,7 +294,7 @@ class SmolVLMWithExpertModel(nn.Module):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            hidden_states = hidden_states.to(dtype=get_compute_dtype(layer.self_attn.q_proj))
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -365,7 +379,7 @@ class SmolVLMWithExpertModel(nn.Module):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            hidden_states = hidden_states.to(dtype=get_compute_dtype(layer.self_attn.q_proj))
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -406,17 +420,17 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_input_shape = expert_hidden_states.shape[:-1]
             expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
 
-            expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
+            expert_hidden_states = expert_hidden_states.to(dtype=get_compute_dtype(expert_layer.self_attn.q_proj))
             expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
 
-            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
+            _key_states = key_states.to(dtype=get_compute_dtype(expert_layer.self_attn.k_proj)).view(
                 *key_states.shape[:2], -1
             )
             expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
                 *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )  # k_proj should have same dim as kv
 
-            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
+            _value_states = value_states.to(dtype=get_compute_dtype(expert_layer.self_attn.v_proj)).view(
                 *value_states.shape[:2], -1
             )
             expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
@@ -527,8 +541,9 @@ class SmolVLMWithExpertModel(nn.Module):
                         continue
                     end = start + hidden_states.shape[1]
 
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                    target_dtype = get_compute_dtype(layer.self_attn.o_proj)
+                    if att_output.dtype != target_dtype:
+                        att_output = att_output.to(target_dtype)
                     att_out = att_output[:, start:end]
                     out_emb = layer.self_attn.o_proj(att_out)
 

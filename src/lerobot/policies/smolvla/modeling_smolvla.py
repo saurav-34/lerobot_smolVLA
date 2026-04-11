@@ -574,18 +574,22 @@ class VLAFlowMatching(nn.Module):
             lora_dropout=self.config.lora_dropout,
             lora_target_modules=self.config.lora_target_modules,
         )
+        # Resolve the device the VLM landed on (device_map="auto" may place it on GPU).
+        # All projection layers must be on the same device.
+        _vlm_device = next(self.vlm_with_expert.get_vlm_model().parameters()).device
+
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
-        )
-        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
-        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        ).to(_vlm_device)
+        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size).to(_vlm_device)
+        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim).to(_vlm_device)
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
-        )
+        ).to(_vlm_device)
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
-        )
+        ).to(_vlm_device)
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
